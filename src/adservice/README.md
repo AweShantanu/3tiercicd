@@ -26,3 +26,4 @@ From `src/adservice/`, run:
 docker build ./
 ```
 
+# CI test

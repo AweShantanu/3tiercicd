@@ -722,3 +722,4 @@ kubectl -n argocd delete secret argocd-initial-admin-secret
 Before deleting it, make sure you've successfully logged in and changed the password.
 
 
+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
