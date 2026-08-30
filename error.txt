@@ -1,0 +1,724 @@
+
+
+Yes — with Kubernetes Gateway API, the flow is a little different from the old Ingress approach.
+
+Assuming you are using AWS Load Balancer Controller with Gateway API in EKS, the architecture is:
+
+                    AWS
+┌─────────────────────────────────────────────┐
+│                                             │
+│  Route 53                                    │
+│      │                                      │
+│      ▼                                      │
+│  ALB / AWS Load Balancer                    │
+│      │                                      │
+│      │ HTTPS :443                           │
+│      │ ACM Certificate                      │
+│      ▼                                      │
+└──────┼──────────────────────────────────────┘
+       │
+       ▼
+   EKS Gateway
+       │
+       ▼
+   HTTPRoute
+       │
+       ▼
+   Kubernetes Service
+       │
+       ▼
+      Pods
+1. ACM certificate
+You still create the certificate exactly the same way:
+
+AWS Console → Certificate Manager → Request
+
+Choose:
+
+Public certificate
+Domain:
+
+app.example.com
+Use:
+
+DNS validation
+After validation:
+
+Status = Issued
+The important thing is the certificate ARN, for example:
+
+arn:aws:acm:ap-south-1:123456789012:certificate/xxxxxxxx
+For an ALB in ap-south-1, the ACM certificate should normally be in ap-south-1.
+
+2. Gateway API is different from Ingress
+With Gateway API, you don't put the certificate annotation directly on an Ingress.
+
+You generally have these resources:
+
+GatewayClass
+     ↓
+Gateway
+     ↓
+HTTPRoute
+     ↓
+Service
+     ↓
+Pod
+The Gateway is where you configure the listener and TLS.
+
+For example:
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+spec:
+  gatewayClassName: alb
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: app.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: my-certificate
+      allowedRoutes:
+        namespaces:
+          from: Same
+But there is an important AWS-specific issue here:
+
+ACM certificates are AWS resources, while certificateRefs in Gateway API normally refer to Kubernetes resources.
+
+So you need the AWS Load Balancer Controller's Gateway API implementation to map your configuration appropriately.
+
+3. How does the ACM certificate get connected?
+This is the part that usually confuses people.
+
+Your certificate exists in AWS:
+
+ACM
+ └── Certificate
+      └── ARN
+Your Gateway exists in Kubernetes:
+
+EKS
+ └── Gateway
+      └── HTTPS listener
+The AWS Load Balancer Controller watches the Gateway and creates/configures the AWS load balancer.
+
+Conceptually:
+
+Kubernetes Gateway
+       │
+       │ watched by
+       ▼
+AWS Load Balancer Controller
+       │
+       ▼
+AWS ALB
+       │
+       └── ACM Certificate
+So you don't put the certificate inside the Pod.
+
+4. Your actual setup
+You likely have something similar to:
+
+GatewayClass
+    |
+    v
+Gateway
+    |
+    +---- HTTPRoute
+    |       |
+    |       v
+    |    Service
+    |       |
+    |       v
+    |      Pods
+    |
+    +---- HTTPS listener
+              |
+              v
+        ACM Certificate
+For example:
+
+Gateway
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: app-gateway
+spec:
+  gatewayClassName: alb
+
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: app.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: app-cert
+HTTPRoute
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app-route
+spec:
+  parentRefs:
+    - name: app-gateway
+
+  hostnames:
+    - app.example.com
+
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+
+      backendRefs:
+        - name: my-service
+          port: 80
+Then:
+
+https://app.example.com
+        ↓
+      Route53
+        ↓
+       ALB
+        ↓
+ HTTPS terminated using ACM
+        ↓
+      Gateway
+        ↓
+    HTTPRoute
+        ↓
+    Service :80
+        ↓
+       Pods
+One important correction
+Don't blindly create the certificateRefs above yet.
+
+The exact certificate configuration depends on which Gateway API implementation/controller you are running. For AWS, this matters because ACM is not a Kubernetes TLS Secret.
+
+Run these commands in your cluster:
+
+kubectl get gatewayclass
+and:
+
+kubectl get gateway -A
+Also:
+
+kubectl get deployment -A | grep -i load-balancer
+Send me the output of those 3 commands (or your current Gateway YAML), and I’ll show you exactly where your ACM certificate ARN needs to go in your current EKS Gateway API setup.
+
+
+i dont have route 53 ..shoild i crete route 53 befor acm 
+
+No. You don't need to create Route 53 before ACM. But you do need control over the DNS for your domain to complete ACM DNS validation.
+
+There are two separate things:
+
+ACM
+→ creates/manages the SSL certificate
+
+Route 53
+→ manages DNS records for your domain
+
+In your case
+If you already own a domain, for example:
+
+example.com
+but its DNS is managed somewhere else, such as Cloudflare, GoDaddy, Namecheap, etc., you can:
+
+Go to ACM
+
+Request certificate for:
+
+app.example.com
+Select DNS validation
+
+ACM gives you a CNAME record
+
+Add that CNAME at whoever currently manages your DNS
+
+ACM validates it and changes to Issued
+
+You do not have to move DNS to Route 53.
+
+What Route 53 would be useful for
+Later, to make:
+
+https://app.example.com
+point to your AWS ALB, you need a DNS record such as:
+
+app.example.com
+       ↓
+ALB
+You can create that record in Route 53 or in your existing DNS provider.
+
+So your setup can be:
+
+Your existing DNS provider
+          │
+          ├── ACM validation CNAME
+          │
+          └── app.example.com → ALB
+                              │
+                              ▼
+                         EKS Gateway
+                              │
+                         HTTPRoute
+                              │
+                            Pods
+If you don't even have a domain yet
+Then yes, you need to buy/register a domain first. You can use Route 53 for that, or another registrar.
+
+For your EKS Gateway API setup, the simplest AWS-only architecture is:
+
+Route 53
+   ↓
+ACM
+   ↓
+ALB
+   ↓
+Gateway API
+   ↓
+HTTPRoute
+   ↓
+Service
+   ↓
+Pods
+But Route 53 is not a prerequisite for creating the ACM certificate.
+
+If you tell me whether you already have a domain and where it is registered, I can give you the exact console steps from domain → ACM → EKS Gateway → HTTPS.
+
+
+i dont have a dokmian till now ...so what are the steps
+
+Since you don't have a domain yet, I would set it up in this order for your EKS Gateway API + ALB + HTTPS:
+
+1. Buy/register domain
+        ↓
+2. Route 53 hosted zone
+        ↓
+3. ACM public certificate
+        ↓
+4. EKS Gateway API / ALB
+        ↓
+5. Connect domain → ALB
+        ↓
+6. Test HTTPS
+Step 1 — Register a domain
+The easiest AWS-only approach is Route 53.
+
+Go to:
+
+AWS Console → Route 53 → Domains → Registered domains → Register domains
+
+Search for something like:
+
+myapp-example.com
+or whatever name you want.
+
+If available, purchase it. When you register a domain through Route 53, AWS automatically creates a hosted zone and configures Route 53 as the DNS service for the domain. 
+
+For learning/testing, you could choose a relatively inexpensive TLD rather than necessarily .com.
+
+Step 2 — Check the Hosted Zone
+After registration:
+
+Route 53 → Hosted zones
+
+You should see:
+
+myapp-example.com
+Inside it, you'll normally have records such as:
+
+NS
+SOA
+Don't delete them.
+
+Step 3 — Create the ACM certificate
+Now go to:
+
+AWS Console → Certificate Manager (ACM)
+
+Make sure you're in the same AWS Region as your ALB/EKS load balancer.
+
+Click:
+
+Request → Public certificate
+
+For example:
+
+app.myapp-example.com
+I would recommend also adding:
+
+*.myapp-example.com
+if you'll have multiple subdomains later.
+
+Choose:
+
+DNS validation
+
+Then request the certificate.
+
+Step 4 — Validate the ACM certificate
+Because Route 53 is now your DNS provider, ACM can create the validation CNAME for you.
+
+Open the certificate → Domain validation → Create records in Route 53.
+
+AWS creates the required DNS record, and the certificate should eventually become:
+
+Issued
+AWS notes that DNS validation can remain pending for a while after creating the record. 
+
+Step 5 — Configure your EKS Gateway
+Now your AWS pieces look like:
+
+Route 53
+   │
+   │ app.myapp-example.com
+   ▼
+ALB
+   │
+   │ HTTPS :443
+   │
+   │ ACM certificate
+   ▼
+EKS Gateway
+   │
+   ▼
+HTTPRoute
+   │
+   ▼
+Service
+   │
+   ▼
+Pod
+The important part here is that your ACM certificate terminates TLS at the AWS load balancer, rather than inside your application pod.
+
+Step 6 — Point your domain to the ALB
+Once your Gateway API creates the ALB, you'll have an ALB DNS name similar to:
+
+k8s-xxxxx.ap-south-1.elb.amazonaws.com
+Then create a Route 53 record:
+
+app.myapp-example.com
+        ↓
+ALIAS
+        ↓
+Your ALB
+So when someone opens:
+
+https://app.myapp-example.com
+the request goes:
+
+Browser
+   ↓ HTTPS
+app.myapp-example.com
+   ↓
+Route 53
+   ↓
+ALB
+   ↓
+ACM certificate
+   ↓
+Gateway API
+   ↓
+HTTPRoute
+   ↓
+Service
+   ↓
+Pod
+One thing I would do differently for your setup
+Since you're specifically using Gateway API, don't create the Gateway YAML from my previous example yet. The exact AWS configuration depends on the GatewayClass/controller version you're running.
+
+Run:
+
+kubectl get gatewayclass
+and:
+
+kubectl get gateway -A
+and paste the output here. Then I can give you the exact sequence from registering the domain all the way to HTTPS on your existing EKS Gateway, including where the ACM certificate ARN goes.
+
+
+
+Pasted text.txt
+Document
+
+
+Pasted text(1).txt
+Document
+
+Perfect ✅ ArgoCD installation is now successful.
+
+You have:
+
+Release:    argo-cd
+Namespace:  argocd
+Status:     deployed
+Chart:      argo-cd-9.4.0
+App:        v3.3.0
+The previous failure was only because the AWS Load Balancer Controller webhook was down. Now that the controller is healthy, the ArgoCD chart installed successfully.
+
+What your argocd-values-9.4.0.yaml should now be doing
+Based on the configuration you showed earlier:
+
+ArgoCD
+  ↓
+server.insecure: true
+  ↓
+ALB terminates HTTPS
+and:
+
+HTTPRoute
+  ↓
+app-alb-gateway
+  ↓
+HTTPS listener
+So the intended flow is:
+
+Browser
+   ↓
+https://argocd.rdhiaditya.space
+   ↓
+Route 53
+   ↓
+AWS ALB :443
+   ↓
+ACM *.rdhiaditya.space
+   ↓
+Gateway: app-alb-gateway
+   ↓
+HTTPRoute
+   ↓
+ArgoCD Server Service
+   ↓
+ArgoCD Server Pod
+Now check the ArgoCD pods
+Run:
+
+kubectl get pods -n argocd
+You should see the ArgoCD components coming up, such as:
+
+argo-cd-argocd-server
+argo-cd-argocd-repo-server
+argo-cd-argocd-application-controller
+argo-cd-argocd-applicationset-controller
+argo-cd-argocd-redis
+Then check the services:
+
+kubectl get svc -n argocd
+You should specifically have:
+
+argo-cd-argocd-server
+Then check the HTTPRoute
+Because your values file has:
+
+httproute:
+  enabled: true
+the Helm chart should have created an HTTPRoute.
+
+Run:
+
+kubectl get httproute -n argocd
+and:
+
+kubectl describe httproute -n argocd
+This is particularly important because your AWS LBC log earlier showed an argocd.rdhiaditya.space listener rule being built, but at that moment it didn't yet have a backend and therefore used a fixed response. 
+
+
+Then check the Gateway
+kubectl get gateway app-alb-gateway -n default
+You want the HTTPS listener's:
+
+Attached Routes
+to become:
+
+1
+instead of the earlier 0.
+
+One more thing: TargetGroupConfiguration
+After ArgoCD installed, apply your target group config:
+
+kubectl apply -f target-grp-config.yaml
+But before doing that, I'd check the actual ArgoCD service name:
+
+kubectl get svc -n argocd
+because your targetReference.name needs to match the actual ArgoCD server Service.
+
+Finally, DNS
+ExternalDNS should create:
+
+argocd.rdhiaditya.space
+        ↓
+ALB
+once it sees the Gateway API route, assuming you've configured gateway-httproute as a source and its IAM/Pod Identity is working.
+
+So you're now at the point where the next checks are simply:
+
+kubectl get pods -n argocd
+kubectl get svc -n argocd
+kubectl get httproute -n argocd
+kubectl get gateway -n default
+Paste those four outputs, and we can verify the ArgoCD → HTTPRoute → ALB → DNS chain end-to-end.
+
+
+ and the random password generated during the installation. You can find the password by running:
+
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+
+(You should delete the initial secret afterwards as suggested by the Getting Started Guide: https://argo-cd.readthedocs.io/en/stable/getting_started/#4-login-using-the-cli)
+ubuntu@ip-10-0-101-230:~/Production-Grade_GitOps-Driven_Microservices-Demo/argocd$ kubectl get pods -n argocd
+NAME                                                        READY   STATUS      RESTARTS   AGE
+argo-cd-argocd-application-controller-0                     1/1     Running     0          50s
+argo-cd-argocd-applicationset-controller-6554c684f6-26294   1/1     Running     0          50s
+argo-cd-argocd-dex-server-6887fb65bd-82cjj                  1/1     Running     0          50s
+argo-cd-argocd-notifications-controller-5c6cd8ddbb-4fstg    1/1     Running     0          50s
+argo-cd-argocd-redis-b68df8bbc-vjw2k                        1/1     Running     0          50s
+argo-cd-argocd-redis-secret-init-gq9q8                      0/1     Completed   0          56s
+argo-cd-argocd-repo-server-84c66bc5f8-5wrc9                 1/1     Running     0          50s
+argo-cd-argocd-server-78c7b89b96-fdncf                      1/1     Running     0          50s
+ubuntu@ip-10-0-101-230:~/Production-Grade_GitOps-Driven_Microservices-Demo/argocd$ kubectl get httproute -n argocd
+NAME                    HOSTNAMES                     AGE
+argo-cd-argocd-server   ["argocd.rdhiaditya.space"]   69s
+ubuntu@ip-10-0-101-230:~/Production-Grade_GitOps-Driven_Microservices-Demo/argocd$ kubectl get gateway app-alb-gateway -n default
+NAME              CLASS                   ADDRESS                                                                  PROGRAMMED   AGE
+app-alb-gateway   aws-alb-gateway-class   k8s-default-appalbga-b2a04e742e-1552663042.us-east-1.
+
+Yes — ArgoCD itself is now healthy. Your output shows all the main ArgoCD components are Running, and the HTTPRoute was created with the correct hostname. The Completed Redis init pod is also normal.
+
+Your current state is:
+
+ArgoCD Pods                 ✅ Running
+HTTPRoute                   ✅ Created
+Hostname                    ✅ argocd.rdhiaditya.space
+Gateway                     ✅ Programmed
+ALB                         ✅ Created
+ACM wildcard certificate   ✅ Attached
+1. Get the ArgoCD admin password
+Run exactly:
+
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d; echo
+You'll get a random password.
+
+Login credentials:
+
+Username: admin
+Password: <the output above>
+2. Don't delete the secret yet
+The ArgoCD installation notes recommend deleting argocd-initial-admin-secret after you've successfully logged in and changed the admin password.
+
+So first get the password, log in, change it, and then:
+
+kubectl -n argocd delete secret argocd-initial-admin-secret
+3. Your HTTPRoute is correct
+This is important:
+
+NAME                    HOSTNAMES
+argo-cd-argocd-server   ["argocd.rdhiaditya.space"]
+So Helm successfully created the route you configured.
+
+Your route should effectively be:
+
+argocd.rdhiaditya.space
+        ↓
+app-alb-gateway / HTTPS listener
+        ↓
+argo-cd-argocd-server Service
+        ↓
+ArgoCD server Pod
+4. Check whether the route actually attached
+Run:
+
+kubectl describe httproute argo-cd-argocd-server -n argocd
+Look for:
+
+Accepted: True
+ResolvedRefs: True
+Also:
+
+kubectl get gateway app-alb-gateway -n default -o yaml
+Under the HTTPS listener, attachedRoutes should now be 1.
+
+5. One remaining piece: DNS
+Your Gateway/ALB is working, but argocd.rdhiaditya.space must resolve to the ALB.
+
+Once ExternalDNS is configured correctly, it should create:
+
+argocd.rdhiaditya.space
+        ↓
+k8s-default-appalbga-b2a04e742e-1552663042.us-east-1.elb.amazonaws.com
+Check ExternalDNS:
+
+kubectl get pods -n external-dns
+and:
+
+kubectl logs -n external-dns deployment/external-dns --tail=100
+Then check Route 53 for an argocd record.
+
+6. One more important thing: TargetGroupConfiguration
+Before expecting ArgoCD to actually serve traffic through the ALB, verify:
+
+kubectl get targetgroupconfiguration -n argocd
+and:
+
+kubectl get svc -n argocd argo-cd-argocd-server
+Your TargetGroupConfiguration should reference the actual service:
+
+argo-cd-argocd-server
+and use:
+
+targetType: ip
+You're very close
+The complete flow you're aiming for is now:
+
+Browser
+   ↓
+https://argocd.rdhiaditya.space
+   ↓
+Route 53
+   ↓
+AWS ALB
+   ↓
+ACM *.rdhiaditya.space
+   ↓
+Gateway HTTPS :443
+   ↓
+HTTPRoute
+   ↓
+argo-cd-argocd-server
+   ↓
+ArgoCD Pod
+The next useful checks are:
+
+kubectl describe httproute argo-cd-argocd-server -n argocd
+kubectl get targetgroupconfiguration -n argocd
+kubectl get pods -n external-dns
+Those will tell us whether the final HTTPRoute → Service → Pod and DNS → ALB pieces are correctly wired.
+
+
+
+ubuntu@ip-10-0-101-230:~/Production-Grade_GitOps-Driven_Microservices-Demo/argocd$ kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d; echo
+G8H2jK9etXU2rxpF
+
+Good — that confirms the initial ArgoCD admin password was generated successfully.
+
+Use:
+
+Username: admin
+Password: G8H2jK9etXU2rxpF
+Since you posted this password in chat, treat it as exposed. After logging in, change it immediately to a new password.
+
+Then you can remove the bootstrap secret:
+
+kubectl -n argocd delete secret argocd-initial-admin-secret
+Before deleting it, make sure you've successfully logged in and changed the password.
+
+
