@@ -40,12 +40,22 @@ jobs:
       # Build Docker image (cached)
       # -------------------
       - name: Build Image
+        shell: bash
         run: |
+          if [ "${{ inputs.service }}" = "cartservice" ]; then
+            BUILD_CONTEXT="./src/cartservice/src"
+          else
+            BUILD_CONTEXT="./src/${{ inputs.service }}"
+          fi
+
+          echo "Building $IMAGE_NAME"
+          echo "Build context: $BUILD_CONTEXT"
+
           docker build \
             --cache-from=type=gha \
             --cache-to=type=gha,mode=max \
-            -t $IMAGE_NAME \
-            ./src/${{ inputs.service }}
+            -t "$IMAGE_NAME" \
+            "$BUILD_CONTEXT"
 
       # -------------------
       # Security Scan (before push)
