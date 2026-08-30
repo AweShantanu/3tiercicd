@@ -3,7 +3,6 @@
 A production-oriented DevOps project demonstrating how to deploy and operate a containerized microservices application on **AWS EKS** using **Terraform, Docker, Kubernetes, GitHub Actions and Argo CD**, with HTTPS-based routing and monitoring through **Prometheus and Grafana**.
 
 This project is built as a practical demonstration of the DevOps workflow required for provisioning, deployment automation, traffic management and observability.
-
 ---
 
 ## Architecture
