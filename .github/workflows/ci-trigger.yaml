@@ -27,15 +27,26 @@ jobs:
 
       - name: Detect changed services
         id: changed
+        shell: bash
         run: |
-          SERVICES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} \
-            | grep '^src/' \
-            | cut -d'/' -f2 \
-            | sort -u \
-            | jq -R -s -c 'split("\n")[:-1]')
+          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            echo "First push detected. Scanning all services."
+
+            SERVICES=$(find src -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+              | sort \
+              | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          else
+            SERVICES=$(git diff --name-only \
+              "${{ github.event.before }}" \
+              "${{ github.sha }}" \
+              | grep '^src/' \
+              | cut -d'/' -f2 \
+              | sort -u \
+              | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
 
           echo "Detected services: $SERVICES"
-          echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          echo "services=$SERVICES" >> "$GITHUB_OUTPUT"
 
 
   # --------------------------------------------------
